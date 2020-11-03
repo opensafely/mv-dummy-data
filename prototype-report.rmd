@@ -1,0 +1,387 @@
+---
+title: "Parametric DAGs for OpenSAFELY dummy data"
+output:
+  html_document:
+    code_folding: hide
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+thm <- knitr::knit_theme$get("acid")
+knitr::knit_theme$set(thm)
+```
+
+## Introduction
+
+OpenSAFELY provides a framework for generating dummy data for developing and testing study code, but it is only possible generate distributions univariately and independently. This document discusses the use of parametric Directed Acyclic Graphs (p-DAGs) to simulate variables with arbitrarily complex dependency structures.
+
+## p-DAGs
+
+A p-DAG defines relationships between variables. Each node in the network/graph is a variable, and each directed arc shows dependencies between the variables. In contrast to non-parametric DAGs, p-DAGs additionally state how each child node is constructed from its parent node(s). These relationships may be deterministic (eg BMI from height and weight, or time to death from first exposure date and death date) or stochastic (eg the probability of having lung disease is dependent on age and smoking status). 
+
+The implementation of p-DAGs below is a bit janky, but it's enough to demonstrate the idea and to motivate further discussion about how to implement in OpenSAFELY.
+
+Best to start with an example.
+
+
+## import libraries and functions
+
+```{r import, message=FALSE, warning=FALSE}
+library('tidyverse')
+library('dagitty')
+library('survival')
+library('survminer')
+import::from(magrittr, `%$%`)
+
+source(here::here("pdag-functions.R"))
+
+
+rcat <- function(n=1, levels, p){
+  
+  sample(x=levels, size=n, replace=TRUE, prob=p)
+}
+
+censor <- function(date, censor_date, na.censor=TRUE){
+  if (na.censor)
+    if_else(date>censor_date, as.Date(NA_character_, origin = "1970-01-01"), as.Date(date, origin = "1970-01-01"))
+  else
+    if_else(date>censor_date, as.Date(censor_date, origin = "1970-01-01"), as.Date(date, origin = "1970-01-01"))
+}
+
+```
+
+
+## Example 1
+
+Simulate age, sex, diabetes status, number of hospital admissions, and time to death, as follows:
+
+* `sex` and `age` are not dependent on any other variable.
+* `diabetes` is a binary variable dependent on `age` and `sex`, with a `logit` link function (`plogis` is the R name for the inverse of this link function).  
+* `hosp_admission_count` is a Poisson distributed variable dependent on `age`, `sex`, and `diabetes`, with a log link.
+* `time_to_death` is an exponentially distributed variable dependent on all other variables, with a log link.
+
+
+```{r examplepdag1, class.source = "fold-show"}
+example1_list = list(
+  age = node(
+    variable_formula = ~(rnorm(n=1, mean=60, sd=15))
+  ),
+  sex = node(
+    variable_formula = ~(rcat(n=1, levels = c("F", "M"), p = c(0.51, 0.49))),
+  ),
+  diabetes = node(
+    variable_formula = ~(rbernoulli(n=1, p = plogis(-1 + age*0.002 + I(sex=='F')*-0.2))),
+  ),
+  hosp_admission_count = node(
+    variable_formula = ~(rpois(n=1, lambda = exp(-2.5 + age*0.03 + I(sex=='F')*-0.2 +diabetes*1)))
+  ),
+  time_to_death = node(
+    variable_formula = ~(round(rexp(n=1, rate = exp(-5 + age*0.01 + I(age^2)*0.0001 + diabetes*1.5 + hosp_admission_count*1)/365))),
+  )
+)
+
+example1_pdag <- pdag_create(example1_list)
+```
+
+
+In the above code, the pdag is defined in a list, with one list entry for each variable. The entry must be the result of a call the the `node` function, which has a `variable_formula` argument that tells us how to derive a new value for each variable (and other arguments described later). The `variable_formula` must be captured as a formula using `~`, which is only evaluated later at the simulation stage. These formulas can take any valid combination of functions that are supported in R. However, they're not vectorised (hence the `n=1`), which would be useful for random effect models since it would enable `group_by`-type operations.
+
+This list is then passed to the `pdag_create` function, which converts it to a data frame (with list-cols), performs some checks (eg to make sure the DAG is acyclic) and adds a few useful items to the object. This object, `example1_pdag`, defines the p-DAG completely and can be passed to other functions (so far, just drawing the DAG with `pdag_plot` and simulating data with `pdag_simulate`).
+
+The DAG looks like this:
+
+```{r plotdag1}
+pdag_plot(example1_pdag)
+```
+
+Simulated data look like this:
+
+```{r sim1}
+example1_simulation <- pdag_simulate(example1_pdag, 500)
+example1_simulation %>% rmarkdown::paged_table(options = list(rows.print = 15))
+```
+
+We can see for example that diabetes status is now associated with time to death:
+
+```{r plotsurv1}
+survfit(
+  Surv(time=time_to_death, event=censor) ~ diabetes, 
+  data = example1_simulation %>% mutate(censor=1)
+) %>%
+ggsurvplot(
+  conf.int = TRUE,
+  ggtheme = theme_minimal(), 
+  xlim = c(0, 365),
+  break.x.by = 100
+)
+```
+
+
+This is a good start, but it's not quite in line with the data that would be returned using a study definition run on real data. For instance, age is not an integer, deaths are reported as a time-difference not a date, and there are no missing values.
+
+## Example 2
+
+As before, we simulate age, sex, diabetes status, number of hospital admissions, and death.  In addition, we simulate the following variables:
+
+* `region`, which has no dependencies
+* `index_date`, which is a reference date for the date variables, and the start of the simulated study period
+* `end_date`, which is the end of the simulated study period
+* `death_date`, which is derived from `time_to_death` and `index_date`, with `end_date` a censoring time (so that deaths occurring after `end_date` are not observed).
+
+Other existing variables are modified to better match what would be returned in a study cohort:
+
+* `age` is rounded down to the nearest integer
+* `diabetes` is now `0`/`1`, not `TRUE`/`FALSE`.
+* Some values of `sex` and `hospital_admission_count` are removed, to simulate missing data.
+
+Finally, we specify that `index_date`, `end_date`, and `time_to_death` be dropped in the outputted simulated data since these variables would not be returned in a study cohort run on real data.
+
+```{r examplelist2, class.source = "fold-show"}
+example2_list = list(
+  index_date = node(
+      variable_formula = ~"2020-01-01",
+      keep = FALSE
+    ),
+    end_date = node(
+      variable_formula = ~"2020-10-01",
+      keep = FALSE
+    ),
+    region = node(
+      variable_formula = ~rcat(n=1, levels=c("N", "S", "E", "W"), p = c(0.1,0.2,0.3,0.4))
+    ),
+    age = node(
+      variable_formula = ~floor(rnorm(n=1, mean=60, sd=15))
+    ),
+    sex = node(
+      variable_formula = ~rcat(n=1, levels = c("F", "M"), p = c(0.51, 0.49)),
+      missing_rate = ~0.1 # this is shorthand for ~(rbernoulli(n=1, p = 0.2))
+    ),
+    diabetes = node(
+      variable_formula = ~rbernoulli(n=1, p = plogis(-1 + age*0.02 + I(sex=='F')*-0.2))*1
+    ),
+    hosp_admission_count = node(
+      variable_formula = ~rpois(n = 1, lambda = exp(-2.5 + age*0.03 + I(sex=='F')*-0.2 +diabetes*1)),
+      missing_rate = ~plogis(-2 + I(!diabetes)*0.5)
+    ),
+    time_to_death = node(
+      variable_formula = ~rexp(n=1, rate = exp(-5 + age*0.01 + I(age^2)*0.0001 + diabetes*1.5 + hosp_admission_count*1)/365),
+      keep = FALSE
+    ),
+    death_date = node(
+      variable_formula = ~censor(as.Date(index_date) + time_to_death, end_date, na.censor=TRUE),
+      missing_rate = ~0
+    )
+  )
+
+example2_pdag <- pdag_create(example2_list)
+```
+
+
+This pdag specification uses two extra features of the `node` function:
+
+* `missing_rate`. This takes a formula specifying the probability of missingness for the variable. It could be a constant, eg `~0.1`, which would result in 10\% of values being removed (on average). Or it could be a function that returns a value from 0 to 1, that says how the probability of missing changes depending on other values. For instance `~p=0.2 + 0.1*(sex=="M")` says that missingness should be 20\% when `sex=="F"` and 30\% when `sex=="M"`. This is applied after all data are simulated so that, for example, missingness in variable `y` can depend on values in `x` that are themselves missing. 
+* `keep`. This says whether the variable should be kept or not in the final simulated dataset. It's useful for latent variables that wouldn't be seen in a study cohort, for example, time to death.
+
+The DAG looks like this:
+
+```{r plotdag2}
+pdag_plot(example2_pdag)
+```
+
+
+Simulated data look like this:
+
+```{r sim2}
+example2_simulation2 <- pdag_simulate(example2_pdag, 500, keep_all = FALSE)
+# temp bug fix! because purrr::map functions drop date attributes for numeric vectors
+example2_simulation2$death_date <- as.Date(example2_simulation2$death_date, origin = "1970-01-01")
+
+example2_simulation2 %>% rmarkdown::paged_table(options = list(rows.print = 15))
+```
+
+
+As in example 1, diabetes status is associated with time to death. To match what would be necessary in a study cohort containing only `death_date`, we re-calculate the `time_to_death` variable. This time, deaths that occurred after the end date are appropriately censored.
+
+```{r plotsurv2}
+
+survfit(
+  Surv(time=time_to_death, event=event) ~ diabetes, 
+  data = example2_simulation2 %>% 
+    mutate(
+      event=!is.na(death_date),
+      time_to_death = if_else(!event, as.Date("2020-10-01"), as.Date(death_date)) - as.Date("2020-01-01")
+    )
+) %>%
+ggsurvplot(
+  conf.int = TRUE,
+  ggtheme = theme_minimal(), 
+  xlim = c(0, 365),
+  break.x.by = 100
+)
+```
+
+
+
+## How would this look in a study definition?
+
+As a quick first-try, it would be something like this:
+
+```py
+
+study = StudyDefinition(
+
+  <variables>
+
+  age=patients.age_as_of(
+    index_date,
+    return_expectations={
+      "variable_formula": "floor(bernoulli.rvs(60, 15))",
+    },
+  ),
+
+  sex=patients.sex(
+    return_expectations={
+      "variable_formula": "categorical.rvs(['F', 'M'], p=[0.51, 0.49])",
+      "missing_rate": "0.1",
+    }
+  ),
+    
+    
+  diabetes=patients.with_these_clinical_events(
+    diabetes_code,
+    returning="binary_flag",
+    return_expectations={
+      "variable_formula": "bernoulli.rvs(p=expit(-1 + age*0.02 + (sex=='F')*-0.2))",
+      "missing_rate": "0.1",
+    }
+  ),
+
+  <other_variables>
+)
+```
+
+It replaces R lists with python dictionaries (which is fine), and formulae with strings (which isn't). Strings aren't ideal as you lose syntax highlighting (could this be replaced in Python with lambda functions or something else?). Also, in order to avoid a lot of `library.function`ing (eg `scipt.stats.bernoulli.rvs()` and `math.floor()`), it requires an OpenSAFELY-specific library of commonly used distributions and functions to be curated, with good documentation, that makes formulas easier to define and read. Either that, or import and use software from elsewhere, for example STAN or JAGS, where those things are in-built  (see below). 
+
+## Key features
+
+To be useful, the new framework should support the following features, only some of which are implemented above.
+
+* Support for a broad a class of relationships, models, and transformation functions (`exp`, `log`, `floor`, `round`, `date`, etc). The implementation above supports any function in the `rdist` family in base R, and any post-sampling transformation you can think of. 
+* Support for both deterministic and stochastic relationships. 
+* Support for logical, integer, float, categorical, and date variable types.
+* For sense-checking, tools that visualise the the DAG and distributions of simulated values.
+* Support for latent or temporary variables which would not be extracted in a real study cohort.
+* Good tests that catch errors early and explain the problem well. E.g., to test 5that the graph isn't cyclic and if so which path is cyclic.
+* In the study definition, variables shouldn't necessarily have to be written in an order that respects variable dependencies. For example if `diabetes` depends on `age`, `age=patient.age_as_of()` can still come after `diabetes=patients.with_these_clinical_events(...)`. This just requires calculating the _topological order_ of each variable in the DAG and simulating values in that order.
+* Checks that the `returning` value matches the simulated value.
+* A consistent, well-documented API, with lots of examples. 
+* Ideally be able to specify the relationships outside of a text string (as with R formulas above), so that IDE syntax highlighting / error-checking works. 
+* The option to use the framework to simulate data outside of a study definition (as above). This can be useful for testing and developing locally, before thinking in more detail about how to define variables properly. This could be the option to import the p-DAG into the study definition, matching on the variable keys in `studyDefinition`. 
+* The ability to simulate data from empirical distributions found in the real data. For example, so that age-sex-deprivation is distributed as per the general EHR population. There are a few ways to do this:
+  (a) create a synthetic dataset of commonly extracted variables, make this dataset available to cohortextractor, and allow random samples with replacement to be taken from the dataset. This would be easy to do but would increase the size of the cohortextractor.
+  (b) capture the multivariate distribution of commonly extracted variables parameterically, and simulate data from this. This would be a bit harder to get right, but wouldn't require a big dataset to be shipped with cohortextractor
+  (c) capturing multivariate distribution of commonly extracted variables non-parameterically and simulating from this is probably a no-go. Non-parameteric multivariate distributions are odd and unstable when you have more than a few variables, and storing this distribution would take up almost as much room as a synthetic dataset anyway (certainly for numeric data). 
+
+
+## Notes
+
+Surprisingly, there are no general-purpose packages in R to simulate data from a p-DAG. Some packages exist for a narrow class of models (eg `abn`, `lavaan`, `bnlearn`, `gRain`) but none that allow arbitrary model complexity. `simcausal` is close but is no longer under active development, `simMixedDAG` doesn't have a study-definition-friendly API or a way to specify deterministic relationships. 
+
+Note a p-DAG is equivalent to an Additive Bayesian Network, but ABNs are typically discussed in terms of learning models from, or fitting models to, empirical data. Here we're interested in constructing a pDAG without using data in any formal or structural sense.
+
+Obviously, this needs to be implemented in Python, not R.
+
+For the purposes of generating useful dummy data, it's not necessary for relationships to respect real causal relationships.
+
+## Alternatives
+
+### Refactoring `variable_formula`
+
+There may be advantages to splitting up the stochastic and the deterministic components of variable simulation. For instance for age in the examples above, there is the random `rnorm` component and the deterministic `floor` component. The API would look like this:
+
+```{r refactor1, eval=FALSE, class.source = "fold-show"}
+list(
+  age = node(
+    distribution_formula = ~rnorm(n=1, mean=60, sd=15),
+    transform_formula = ~floor(age),
+    missing_rate = ~0.1
+  )
+)
+```
+
+Going even further, we could separate out the distribution arguments from the distribution function:
+```{r refactor2, eval=FALSE, class.source = "fold-show"}
+list(
+  age = node(
+    distribution_function = "rnorm",
+    distribution_arguments = list(mean = ~60, sd = ~15),
+    transform_formula = ~floor(age),
+    missing_rate = ~0.1
+  )
+)
+```
+
+
+This is just to say that, if it's easier to implement or it provides more control over permitted functions or whatever, then this approach would have a reasonable API.
+
+### STAN
+
+[STAN](https://mc-stan.org/) is a cross-platform probabilistic programming language for Bayesian analysis. It allows you to build arbitrarily complex statistical models. It's mainly used for fitting Bayesian models with real data, but it's possible to use it for data simulation too without any data.
+
+Advantages:
+* [Good documentation](https://mc-stan.org/docs/2_25/stan-users-guide/index.html)
+* Supports a very broad class of models, including random-effects, repeated measures, etc.
+* Ready-made syntax / API for model-specification, with the ability to define custom functions.
+* Supports repeated events data easily, which could be useful when study definitions eventually support many-rows-per-patient datasets.
+* In-built tools for inspection and visualisation of distributions (marginal and conditional).
+
+Disadvantages:
+* Needs to be installed locally.
+* Difficulties specifying dates and categorical variables intuitively, but wrapper functions could make this easier.
+* Takes a little while to compile (up to 30 seconds), even for small DAGs.
+* Possibly overkill given we wouldn't need any of the model-fitting MCMC functionality. 
+
+The p-DAG specification would look something like this:
+
+
+```{r examplelist3stan, class.source = "fold-show"}
+abn_stan = 
+  list(
+    age = list(
+      distr="normal", type="real", 
+      params=list(mu~60, sigma~20)
+    ),
+    female = list(
+      distr="bernoulli", type="int", 
+      params=list(theta ~0.51)
+    ), # no easy way to specify categorical distributions
+    #sex = list(
+    #  distr="categorical", type="int", 
+    #  params=list(theta ~ vector 0.51)
+    #),
+    dm = list(
+      distr="bernoulli", type="int", 
+      params=list(theta ~ inv_logit(-1 + age*0.02 + female*-0.2))
+    ),
+    #dm = list(
+    #  distr="bernoulli_logit", type="int", 
+    #  params=list(alpha~-1 + age*0.02 + female*-0.2)
+    #  ), #alternative formulation
+    hosp_admission_count = list(
+      distr="poisson", type="int", 
+      params=list(lambda ~ exp(-2.5 + age*0.01 + female*-0.2 +dm*1))
+    ),
+    time_to_death = list(
+      distr="exponential", type="real", 
+      params=list(beta ~ exp(-4 + age*0.02 + diabetes*2 + hosp_admission_count*1))
+    )
+  )
+```
+
+<!-- There is a R package `brms` which provides a friendly-interface to STAN from R, with R-like model formulae for model specification.  -->
+
+## JAGS
+
+Similar to STAN. The main differences are the API and the MCMC framework. More or less same advantages and disadvantages as above. 
