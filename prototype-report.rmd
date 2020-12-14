@@ -9,8 +9,8 @@ output:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
-thm <- knitr::knit_theme$get("acid")
-knitr::knit_theme$set(thm)
+#thm <- knitr::knit_theme$get("acid")
+#knitr::knit_theme$set(thm)
 ```
 
 ## Introduction
@@ -99,7 +99,7 @@ pdag_plot(example1_pdag)
 Simulated data look like this:
 
 ```{r sim1}
-example1_simulation <- pdag_simulate(example1_pdag, 500)
+example1_simulation <- pdag_simulate(example1_pdag, pop_size = 500)
 example1_simulation %>% rmarkdown::paged_table(options = list(rows.print = 15))
 ```
 
@@ -194,11 +194,11 @@ pdag_plot(example2_pdag)
 Simulated data look like this:
 
 ```{r sim2}
-example2_simulation2 <- pdag_simulate(example2_pdag, 500, keep_all = FALSE)
+example2_simulation <- pdag_simulate(example2_pdag, pop_size = 500, keep_all = FALSE)
 # temp bug fix! because purrr::map functions drop date attributes for numeric vectors
-example2_simulation2$death_date <- as.Date(example2_simulation2$death_date, origin = "1970-01-01")
+example2_simulation$death_date <- as.Date(example2_simulation$death_date, origin = "1970-01-01")
 
-example2_simulation2 %>% rmarkdown::paged_table(options = list(rows.print = 15))
+example2_simulation %>% rmarkdown::paged_table(options = list(rows.print = 15))
 ```
 
 
@@ -208,7 +208,7 @@ As in example 1, diabetes status is associated with time to death. To match what
 
 survfit(
   Surv(time=time_to_death, event=event) ~ diabetes, 
-  data = example2_simulation2 %>% 
+  data = example2_simulation %>% 
     mutate(
       event=!is.na(death_date),
       time_to_death = if_else(!event, as.Date("2020-10-01"), as.Date(death_date)) - as.Date("2020-01-01")
@@ -222,6 +222,54 @@ ggsurvplot(
 )
 ```
 
+
+
+## Example 3
+
+Now suppose we already have a dataset from which we want to derive additional variables. This for example could be a certified non-disclosive synthetic dataset derived from OpenSAFELY data, that has been released for this specific purpose. Let's say its variables are an anonymous identifier `ptid`, `age`, and `sex`. It looks like this:
+
+```{r }
+OS_data <- tibble(
+  ptid = 1:1000,
+  age = floor(rnorm(n=1000, mean=65, sd=15)),
+  sex = rcat(n=1000, levels = c("F", "M"), p = c(0.51, 0.49))
+)
+
+OS_data
+```
+
+
+We use the same Bayesian Network in Example 1. The difference is that this time `age` and `sex` are already given in advance.
+```{r examplelist3, class.source = "fold-show"}
+example3_list = list(
+  diabetes = node(
+    variable_formula = ~(rbernoulli(n=1, p = plogis(-1 + age*0.002 + I(sex=='F')*-0.2))),
+  ),
+  hosp_admission_count = node(
+    variable_formula = ~(rpois(n=1, lambda = exp(-2.5 + age*0.03 + I(sex=='F')*-0.2 +diabetes*1)))
+  ),
+  time_to_death = node(
+    variable_formula = ~(round(rexp(n=1, rate = exp(-5 + age*0.01 + I(age^2)*0.0001 + diabetes*1.5 + hosp_admission_count*1)/365))),
+  )
+)
+
+example3_pdag <- pdag_create(example3_list, known_variables = c("age", "sex"))
+```
+
+Here the list describing how we define simulated variables, that we pass to `pdag_create`, obviously doesn't need to define the variables that already exist in the given dataset. But we still provide the names of pre-existing dependencies for these simulated variables by passing them to the `known_variables` argument &mdash; this is a useful step to check the validity of the `variable_formula` values, to be explicit about what variables are expected to exist in the given dataset, and to ensure they appear in the complete DAG. 
+
+The DAG is the same as in Example 1:
+
+```{r plotdag3}
+pdag_plot(example3_pdag)
+```
+The patient identifier `ptid` has not been passed to `known_variables` so it does not appear in the DAG, but it could have been and if so would appear in the DAG as an isolated node. Either way, `ptid` will appear in the final dataset, which looks like this;
+
+
+```{r sim3}
+example3_simulation <- pdag_simulate(example3_pdag, data = OS_data)
+example3_simulation %>% rmarkdown::paged_table(options = list(rows.print = 15))
+```
 
 
 ## How would this look in a study definition?
@@ -262,7 +310,36 @@ study = StudyDefinition(
 )
 ```
 
-It replaces R lists with python dictionaries (which is fine), and formulae with strings (which isn't). Strings aren't ideal as you lose syntax highlighting (could this be replaced in Python with lambda functions or something else?). Also, in order to avoid a lot of `library.function`ing (eg `scipt.stats.bernoulli.rvs()` and `math.floor()`), it requires an OpenSAFELY-specific library of commonly used distributions and functions to be curated, with good documentation, that makes formulas easier to define and read. Either that, or import and use software from elsewhere, for example STAN or JAGS, where those things are in-built  (see below). 
+
+It replaces R lists with python dictionaries (which is fine), and formulae with strings (which isn't). Strings aren't ideal as you lose syntax highlighting (could this be replaced in Python with lambda functions or something else?). Also, in order to avoid a lot of `library.function`ing (eg `scipt.stats.bernoulli.rvs()` and `math.floor()`), it requires the curation of an OpenSAFELY-specific library of commonly used distributions and functions, with good documentation, that makes formulas easier to define and read. Either that, or import and use software from elsewhere, for example STAN or JAGS, where those things are in-built  (see below).
+
+To use an existing dataset to simulate new data, as in example 3, `return_expectations` just needs to point to the dataset where the variable exists, for example using a `from_data` key, whose value contains the name of the dataset and the name of the variable:
+
+
+```py
+
+study = StudyDefinition(
+
+  <variables>
+  
+   age=patients.age_as_of(
+    index_date,
+    return_expectations={
+      "from_data": {data: dataset_name, variable: "age"}
+    },
+  ),
+
+  sex=patients.sex(
+    return_expectations={
+      "from_data": {data: dataset_name, variable: "sex"}
+    }
+  ),
+  
+)
+
+```
+
+There may be a better what that removes redundancy of having to specify the `dataset_name` each time. 
 
 ## Key features
 
@@ -283,13 +360,23 @@ To be useful, the new framework should support the following features, only some
   (a) create a synthetic dataset of commonly extracted variables, make this dataset available to cohortextractor, and allow random samples with replacement to be taken from the dataset. This would be easy to do but would increase the size of the cohortextractor.
   (b) capture the multivariate distribution of commonly extracted variables parameterically, and simulate data from this. This would be a bit harder to get right, but wouldn't require a big dataset to be shipped with cohortextractor
   (c) capturing multivariate distribution of commonly extracted variables non-parameterically and simulating from this is probably a no-go. Non-parameteric multivariate distributions are odd and unstable when you have more than a few variables, and storing this distribution would take up almost as much room as a synthetic dataset anyway (certainly for numeric data). 
+  
+## Why not just provide a correlation matrix between all variables?
+
+**tl;dr** We need a way to capture the (possibly simplified, smoothed, etc) joint distribution of the required variables.  Correlation is a normalised measure of the _linear_ relationship between two variables, and so it won't adequately capture non-linear relationships such as that between age and time to death. It doesn't tell us anything about the marginal distributions, which are also required. However, specifying both correlations and marginal distributions naively may not in general lead to a feasible joint distribution. (i.e., we may not always be able to satisfy `pdf(X)=f_x(x)` and `pdf(Y)=f_y(y)` and `cor(x, y)=r` for arbitrary `f_x`, `f_Y`, `-1<r<1`). For higher dimensions this becomes even harder. There may be a role for copulas here, where the marginal distributions and correlations between _transformed_ variables are defined, but these may not easily lead sensible joint distributions 
+
+Instead, by defining the structural relationships between variables (`x_i ~ f_i(x_1, ..., x_n)` for all `i`, where in reality we're only using a small number of variables to define each `x_i`) and just let the correlations be whatever they need to be to satisfy those relationships.
+
+The second approach is both easier to implement, and easier to work with once you start trying to define correlations for non-linear or non-binary variables, and non-linear relationships.
 
 
 ## Notes
 
-Surprisingly, there are no general-purpose packages in R to simulate data from a p-DAG. Some packages exist for a narrow class of models (eg `abn`, `lavaan`, `bnlearn`, `gRain`) but none that allow arbitrary model complexity. `simcausal` is close but is no longer under active development, `simMixedDAG` doesn't have a study-definition-friendly API or a way to specify deterministic relationships. 
+Some packages exist for a narrow class of models (eg `abn`, `lavaan`, `bnlearn`, `gRain`) but none that allow arbitrary model complexity. `simcausal` is close but is no longer under active development, `simMixedDAG` doesn't have a study-definition-friendly API or a way to specify deterministic relationships. 
 
-Note a p-DAG is equivalent to an Additive Bayesian Network, but ABNs are typically discussed in terms of learning models from, or fitting models to, empirical data. Here we're interested in constructing a pDAG without using data in any formal or structural sense.
+`simsurvey`
+
+Note a p-DAG is equivalent to an Bayesian Network, but BNs are typically discussed in terms of learning models from, or fitting models to, empirical data. Here we're interested in constructing a pDAG without using data in any formal or structural sense.
 
 Obviously, this needs to be implemented in Python, not R.
 
