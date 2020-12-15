@@ -78,7 +78,7 @@ pdag_create <- function(list, known_variables=NULL){
   
   stopifnot("graph is not acyclic" = isAcyclic(dagitty)) 
   stopifnot("not all dependencies are defined" = all(simplify(unique(flatten(df$dependencies))) %in% df$variable))
-  stopifnot("variable names are not unique" = length(df$variable) == length(distinct(df$variable)))
+  stopifnot("variable names are not unique" = length(df$variable) == length(unique(df$variable)))
   
   df
 }
