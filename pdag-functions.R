@@ -6,10 +6,23 @@ library('dagitty')
 #"not in" infix function
 `%ni%` <- Negate(`%in%`)
 
+#
+rcat <- function(n=1, levels, p){
+  sample(x=levels, size=n, replace=TRUE, prob=p)
+}
+
+censor <- function(date, censor_date, na.censor=TRUE){
+  if (na.censor)
+    if_else(date>censor_date, as.Date(NA_character_, origin = "1970-01-01"), as.Date(date, origin = "1970-01-01"))
+  else
+    if_else(date>censor_date, as.Date(censor_date, origin = "1970-01-01"), as.Date(date, origin = "1970-01-01"))
+}
+
+
 #get all functions used in a formula, and exclude variables
 all.funs = function(expr){all.names(expr, unique=TRUE)[!(all.names(expr, unique=TRUE) %in% all.vars(expr))]}
 
-node <- function(variable_formula, missing_rate=~0, keep=TRUE, known=FALSE){
+node <- function(variable_formula, missing_rate=~0, keep=TRUE, known=FALSE, needs=character()){
   
   stopifnot(rlang::is_formula(variable_formula))
   stopifnot(rlang::is_formula(missing_rate))
@@ -19,7 +32,8 @@ node <- function(variable_formula, missing_rate=~0, keep=TRUE, known=FALSE){
     variable_formula = variable_formula,
     missing_rate = missing_rate,
     keep = keep,
-    known = known
+    known = known,
+    needs = c(character(), needs)
   )
   
   class(l) <- append(class(l), "node")
@@ -37,7 +51,7 @@ pdag_create <- function(list, known_variables=NULL){
   # for variables that are already defined externally in a 
   # given dataset, which can be passed to pdag_simulate
   
-  # whilst the variable_formula is the variable name itself, this is to help with the pdag_simulate function
+  # whilst variable_formula is the variable name itself, this is to help with the pdag_simulate function
   # it doesn't actually lead to self-dependence (eg var depends on var)
   
   
@@ -45,16 +59,27 @@ pdag_create <- function(list, known_variables=NULL){
   
   
   df <- list %>%
-    enframe(name="variable", value="list") %>% unnest_wider("list") %>%
-    mutate(
-      dependencies = map(variable_formula, ~all.vars(.)),
-      missing_formula = map(missing_rate, ~{
-        rhs <- deparse1(rlang::f_rhs(.))
-        fun <- as.formula(paste0("~rbernoulli(n=1, p=", rhs, ")"))
-        fun
-      }),
-      known = FALSE,
-    )
+    enframe(name="variable", value="list") %>% 
+    unnest_wider("list")
+  
+  # this bit is needed because if there are no nodes with "needs" specified, this variable does not 
+  # get unnested, so needs to be created explicitly
+  # otherwise if at least one "need" is specified, then for all nodes without needs, `need` is converted from
+  # character() to NA, so need to undo.
+  if(!("needs" %in% names(df))){
+    df$needs = list(character())
+  } else{
+    df$needs = map(df$needs, ~{if(is.na(.)) character() else . })
+  }
+    
+  df <- mutate(df, 
+    dependencies = map(variable_formula, ~all.vars(.)),
+    missing_formula = map(missing_rate, ~{
+      rhs <- deparse1(rlang::f_rhs(.))
+      fun <- as.formula(paste0("~rbernoulli(n=1, p=", rhs, ")"))
+      fun
+    }),
+  )
   
   if(!is.null(known_variables)){
     
@@ -67,6 +92,7 @@ pdag_create <- function(list, known_variables=NULL){
         dependencies = list(character()),
         missing_formula = list(as.formula("~rbernoulli(n=1, p=0)")),
         known = TRUE,
+        needs = list(character())
       )
     
     df <- bind_rows(df_available, df)
@@ -134,25 +160,58 @@ pdag_simulate <- function(pdag, data=NULL, pop_size, keep_all=FALSE){
   else
     tbl0 <- data
   
+  
   pdag_ordered_unknown <- pdag_ordered %>% filter(!known)
   
   tblsim_complete <- compose(!!!pdag_ordered_unknown$pdag_fun, .dir='forward')(tbl0)
   
-  missing_formula <-  setNames(pdag_ordered_unknown$missing_formula, pdag_ordered_unknown$variable)
+  # make some values missing, according to missing
   
-  # make some values missing, according to missing_fun
-  tblsim <- pmap_df(
-    lst(tblsim_complete = tblsim_complete[pdag_ordered_unknown$variable], missing_formula, simdat=list(tblsim_complete)), 
-    function(tblsim_complete, missing_formula, simdat){
+  missing_formula <- setNames(pdag_ordered_unknown$missing_formula, pdag_ordered_unknown$variable)
+  
+  tblsim_missing1 <- pmap_df(
+    lst(variable = tblsim_complete[pdag_ordered_unknown$variable], missing_formula, simdat=list(tblsim_complete)), 
+    function(variable, missing_formula, simdat){
       NA_type_ <- NA
-      mode(NA_type_) <- typeof(tblsim_complete)
+      mode(NA_type_) <- typeof(variable)
       row_num <- seq_len(nrow(simdat))
       mask <- map_lgl(row_num, ~eval(rlang::f_rhs(missing_formula), simdat[.,]))
-      if_else(mask, NA_type_, tblsim_complete)
+
+      if_else(mask, NA_type_, variable)
     }
   )
   
-  tblsim <- bind_cols(tbl0, tblsim)
+  # make values missing according to `needs`
+  
+  needs <- setNames(pdag_ordered_unknown$needs, pdag_ordered_unknown$variable)
+  
+  tblsim_missing2 <- pmap_df(
+    lst(variable = tblsim_missing1[pdag_ordered_unknown$variable], needs, simdat=list(tblsim_missing1)), 
+    function(variable, needs, simdat){
+      NA_type_ <- NA
+      mode(NA_type_) <- typeof(variable)
+      
+      if(length(needs)!=0){
+        mask <- simdat %>% 
+          select(all_of(needs)) %>%
+          mutate(across(all_of(needs), ~!is.na(.))) %>%
+          rowwise() %>%
+          mutate(
+            need_satisfied=!all(c_across(all_of(needs)))
+          ) %>% pluck("need_satisfied")
+        
+        
+      }
+      else{        
+        mask <- rep(FALSE, nrow(simdat))
+      }
+  
+      if_else(mask, NA_type_, variable)
+    }
+  )
+  
+  
+  tblsim <- bind_cols(tbl0, tblsim_missing2)
   
   # choose which variables to return
   returnvars <- pdag1 %>% filter(keep | keep_all) %>% pluck("variable")
