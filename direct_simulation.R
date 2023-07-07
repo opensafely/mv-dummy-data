@@ -1,13 +1,4 @@
 library('tidyverse')
-library('survival')
-
-source(here::here("pdag-functions.R"))
-
-
-rcat <- function(n=1, levels, p){
-  
-  sample(x=levels, size=n, replace=TRUE, prob=p)
-}
 
 censor <- function(date, censor_date, na.censor=TRUE){
   if (na.censor)
